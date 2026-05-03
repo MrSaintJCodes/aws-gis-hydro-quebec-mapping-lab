@@ -4,6 +4,8 @@ This project deploys an open-source GIS platform on AWS using Terraform, Docker,
 
 The goal is to provide an ArcGIS-style open-source lab environment for mapping live Hydro-Québec outage data, serving spatial data, and experimenting with GIS infrastructure patterns on AWS.
 
+<img width="1677" height="910" alt="Image" src="https://github.com/user-attachments/assets/c8fb9eda-13f0-44b7-b434-2269197edff5" />
+
 > Note: This is not ArcGIS Enterprise. It is an open-source GIS stack designed to provide similar mapping, spatial database, and web portal capabilities for lab and learning purposes.
 
 ---
