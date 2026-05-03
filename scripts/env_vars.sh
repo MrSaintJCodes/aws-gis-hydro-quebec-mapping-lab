@@ -1,0 +1,5 @@
+export EFS_ID="fs-XXXXXXXXXXX"
+export DB_HOST="name.us-east-1.rds.amazonaws.com"
+export DB_NAME="labdb"
+export DB_USER="labadmin"
+export DB_PASS="dbpass"

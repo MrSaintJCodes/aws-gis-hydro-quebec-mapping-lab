@@ -1,0 +1,115 @@
+services:
+  postgis:
+    image: ${POSTGIS_IMAGE}
+    container_name: opengis-postgis
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgis-data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d
+    networks:
+      - opengis
+
+  geoserver:
+    image: ${GEOSERVER_IMAGE}
+    container_name: opengis-geoserver
+    restart: unless-stopped
+    depends_on:
+      - postgis
+    env_file:
+      - .env
+    environment:
+      GEOSERVER_ADMIN_USER: admin
+      GEOSERVER_ADMIN_PASSWORD: ${GEOSERVER_ADMIN_PASSWORD}
+    volumes:
+      - ./geoserver-data:/opt/geoserver_data
+    networks:
+      - opengis
+
+  pg_tileserv:
+    image: pramsey/pg_tileserv:latest-amd64
+    container_name: opengis-pg-tileserv
+    restart: unless-stopped
+    depends_on:
+      - postgis
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgis:5432/${POSTGRES_DB}"
+    networks:
+      - opengis
+
+  pg_featureserv:
+    image: pramsey/pg_featureserv:latest
+    container_name: opengis-pg-featureserv
+    restart: unless-stopped
+    depends_on:
+      - postgis
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgis:5432/${POSTGRES_DB}"
+    networks:
+      - opengis
+
+  hydro_importer:
+    build: ./importers/hydro-quebec
+    container_name: opengis-hydro-importer
+    profiles:
+      - importer
+    depends_on:
+      - postgis
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgis
+      POSTGRES_PORT: 5432
+    networks:
+      - opengis
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: opengis-pgadmin
+    restart: unless-stopped
+    profiles:
+      - admin
+    depends_on:
+      - postgis
+    env_file:
+      - .env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      SCRIPT_NAME: /pgadmin
+    volumes:
+      - ./pgadmin-data:/var/lib/pgadmin
+    networks:
+      - opengis
+
+  caddy:
+    image: caddy:2
+    container_name: opengis-caddy
+    restart: unless-stopped
+    depends_on:
+      - geoserver
+      - pg_tileserv
+      - pg_featureserv
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./www:/usr/share/caddy:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+    networks:
+      - opengis
+
+networks:
+  opengis:
+    name: opengis

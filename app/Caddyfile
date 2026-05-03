@@ -1,0 +1,28 @@
+{
+    auto_https off
+}
+
+:80 {
+    encode gzip
+
+    handle /geoserver* {
+        reverse_proxy geoserver:8080
+    }
+
+    handle_path /tiles* {
+        reverse_proxy pg_tileserv:7800
+    }
+
+    handle_path /features* {
+        reverse_proxy pg_featureserv:9000
+    }
+
+    handle /pgadmin* {
+        reverse_proxy pgadmin:80
+    }
+
+    handle {
+        root * /usr/share/caddy
+        file_server
+    }
+}

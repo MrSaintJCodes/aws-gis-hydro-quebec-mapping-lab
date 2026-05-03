@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee /var/log/opengis-user-data.log | logger -t opengis-user-data -s 2>/dev/console) 2>&1
+
+AWS_REGION="${aws_region}"
+ARTIFACT_BUCKET="${artifact_bucket}"
+ARTIFACT_KEY="${artifact_key}"
+APP_DIR="/opt/opengis"
+
+echo "=== OpenGIS user-data loader started ==="
+date
+
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y unzip awscli
+
+mkdir -p "$APP_DIR"
+
+echo "Downloading OpenGIS app bundle from S3..."
+aws s3 cp "s3://$ARTIFACT_BUCKET/$ARTIFACT_KEY" /tmp/opengis-app.zip --region "$AWS_REGION"
+
+echo "Extracting OpenGIS app bundle..."
+unzip -o /tmp/opengis-app.zip -d "$APP_DIR"
+
+cat > "$APP_DIR/.env" <<'EOF_ENV'
+PROJECT_NAME=${project_name}
+POSTGRES_DB=${postgres_db}
+POSTGRES_USER=${postgres_user}
+POSTGRES_PASSWORD=${postgres_password}
+GEOSERVER_ADMIN_PASSWORD=${geoserver_admin_password}
+PGADMIN_EMAIL=${pgadmin_email}
+PGADMIN_PASSWORD=${pgadmin_password}
+GEOSERVER_IMAGE=${geoserver_image}
+POSTGIS_IMAGE=${postgis_image}
+ENABLE_PGADMIN=${enable_pgadmin}
+EOF_ENV
+
+chmod 600 "$APP_DIR/.env"
+chmod +x "$APP_DIR/bootstrap.sh"
+
+echo "Running OpenGIS bootstrap..."
+"$APP_DIR/bootstrap.sh"
+
+echo "=== OpenGIS user-data loader completed ==="
+date

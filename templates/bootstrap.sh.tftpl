@@ -1,0 +1,869 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee /var/log/opengis-bootstrap.log | logger -t opengis-bootstrap -s 2>/dev/console) 2>&1
+
+echo "=== OpenGIS Terraform bootstrap started ==="
+date
+
+PROJECT_NAME="${PROJECT_NAME}"
+APP_DIR="/opt/opengis"
+
+POSTGRES_DB="${POSTGRES_DB}"
+POSTGRES_USER="${POSTGRES_USER}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD}"
+
+GEOSERVER_ADMIN_PASSWORD="${GEOSERVER_ADMIN_PASSWORD}"
+
+PGADMIN_EMAIL="${PGADMIN_EMAIL}"
+PGADMIN_PASSWORD="${PGADMIN_PASSWORD}"
+
+GEOSERVER_IMAGE="${GEOSERVER_IMAGE}"
+POSTGIS_IMAGE="${POSTGIS_IMAGE}"
+ENABLE_PGADMIN="${ENABLE_PGADMIN}"
+
+echo "=== Installing packages ==="
+
+apt-get update -y
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  ca-certificates \
+  curl \
+  gnupg \
+  lsb-release \
+  unzip \
+  jq \
+  awscli
+
+# Install Docker Engine and Docker Compose v2 from Docker's official apt repository.
+# Ubuntu's default repositories may not include docker-compose-plugin.
+install -m 0755 -d /etc/apt/keyrings
+
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+cat > /etc/apt/sources.list.d/docker.sources <<EOF_DOCKER_REPO
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME}}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.gpg
+EOF_DOCKER_REPO
+
+apt-get update -y
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  docker-ce \
+  docker-ce-cli \
+  containerd.io \
+  docker-buildx-plugin \
+  docker-compose-plugin
+
+systemctl enable --now docker
+
+echo "=== Creating app directories ==="
+
+mkdir -p "$APP_DIR"
+mkdir -p "$APP_DIR/www"
+mkdir -p "$APP_DIR/geoserver-data"
+mkdir -p "$APP_DIR/postgis-data"
+mkdir -p "$APP_DIR/pgadmin-data"
+mkdir -p "$APP_DIR/caddy-data"
+mkdir -p "$APP_DIR/caddy-config"
+mkdir -p "$APP_DIR/importers/hydro-quebec"
+
+echo "=== Writing Hydro-Québec outage importer ==="
+
+cat > "$APP_DIR/importers/hydro-quebec/import_hydro_outages.py" <<'PYTHON'
+#!/usr/bin/env python3
+import json
+import os
+import re
+from typing import Any, Optional, Tuple
+
+import psycopg2
+from psycopg2.extras import Json
+import requests
+
+
+BIS_VERSION_URL = "https://pannes.hydroquebec.com/pannes/donnees/v3_0/bisversion.json"
+BIS_MARKERS_URL = "https://pannes.hydroquebec.com/pannes/donnees/v3_0/bismarkers{version}.json"
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgis")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "gis")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "gisuser")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+
+
+STATUS_MAP = {
+    "A": "Work assigned",
+    "L": "Crew at work",
+    "R": "Crew en route",
+    "": "Unknown",
+}
+
+CAUSE_MAP = {
+    "11": "Equipment failure",
+    "12": "Equipment failure",
+    "13": "Equipment failure",
+    "14": "Equipment failure",
+    "15": "Equipment failure",
+    "58": "Equipment failure",
+    "70": "Equipment failure",
+    "72": "Equipment failure",
+    "73": "Equipment failure",
+    "74": "Equipment failure",
+    "79": "Equipment failure",
+    "21": "Weather conditions",
+    "22": "Weather conditions",
+    "24": "Weather conditions",
+    "25": "Weather conditions",
+    "26": "Weather conditions",
+    "31": "Accident or incident",
+    "32": "Accident or incident",
+    "33": "Accident or incident",
+    "34": "Accident or incident",
+    "41": "Accident or incident",
+    "42": "Accident or incident",
+    "43": "Accident or incident",
+    "44": "Accident or incident",
+    "54": "Accident or incident",
+    "55": "Accident or incident",
+    "56": "Accident or incident",
+    "57": "Accident or incident",
+    "51": "Vegetation damage",
+    "52": "Animal damage",
+    "53": "Animal damage",
+}
+
+
+def get_latest_bis_version() -> str:
+    response = requests.get(BIS_VERSION_URL, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+    text = json.dumps(data)
+
+    match = re.search(r"\d{14}", text)
+    if not match:
+        raise RuntimeError(f"Could not find BIS version in response: {data}")
+
+    return match.group(0)
+
+
+def fetch_outages(version: str) -> list:
+    url = BIS_MARKERS_URL.format(version=version)
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+    return data.get("pannes", [])
+
+
+def parse_point(value: Any) -> Optional[Tuple[float, float]]:
+    if not value:
+        return None
+
+    try:
+        lon, lat = json.loads(value)
+        return float(lon), float(lat)
+    except Exception:
+        return None
+
+
+def connect():
+    if not POSTGRES_PASSWORD:
+        raise RuntimeError("POSTGRES_PASSWORD environment variable is required")
+
+    return psycopg2.connect(
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+    )
+
+
+def init_schema(conn):
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public.hydro_quebec_outages_current (
+                id BIGSERIAL PRIMARY KEY,
+                source_version TEXT NOT NULL,
+                source_index INTEGER NOT NULL,
+                affected_customers INTEGER,
+                outage_start TIMESTAMP,
+                estimated_restore TIMESTAMP,
+                event_type TEXT,
+                status_code TEXT,
+                status_label TEXT,
+                raw_cause_code TEXT,
+                cause_label TEXT,
+                municipality_code TEXT,
+                message_id TEXT,
+                raw_record JSONB NOT NULL,
+                geom geometry(Point, 4326),
+                imported_at TIMESTAMP NOT NULL DEFAULT now()
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS hydro_quebec_outages_current_geom_idx
+            ON public.hydro_quebec_outages_current
+            USING GIST (geom);
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS hydro_quebec_outages_current_imported_at_idx
+            ON public.hydro_quebec_outages_current (imported_at);
+            """
+        )
+
+    conn.commit()
+
+
+def refresh_current_outages(conn, version: str, outages: list) -> int:
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE TABLE public.hydro_quebec_outages_current;")
+
+        for index, record in enumerate(outages):
+            affected_customers = record[0] if len(record) > 0 else None
+            outage_start = record[1] if len(record) > 1 else None
+            estimated_restore = record[2] if len(record) > 2 else None
+            event_type = record[3] if len(record) > 3 else None
+            point = parse_point(record[4]) if len(record) > 4 else None
+            status_code = record[5] if len(record) > 5 else ""
+            raw_cause_code = record[7] if len(record) > 7 else ""
+            municipality_code = record[8] if len(record) > 8 else ""
+            message_id = record[9] if len(record) > 9 else ""
+
+            status_label = STATUS_MAP.get(str(status_code), "Unknown")
+            cause_label = CAUSE_MAP.get(str(raw_cause_code), "Unknown")
+
+            lon = point[0] if point else None
+            lat = point[1] if point else None
+
+            cur.execute(
+                """
+                INSERT INTO public.hydro_quebec_outages_current (
+                    source_version,
+                    source_index,
+                    affected_customers,
+                    outage_start,
+                    estimated_restore,
+                    event_type,
+                    status_code,
+                    status_label,
+                    raw_cause_code,
+                    cause_label,
+                    municipality_code,
+                    message_id,
+                    raw_record,
+                    geom,
+                    imported_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    NULLIF(%s, '')::timestamp,
+                    NULLIF(%s, '')::timestamp,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    CASE
+                        WHEN %s IS NOT NULL AND %s IS NOT NULL
+                        THEN ST_SetSRID(ST_MakePoint(%s, %s), 4326)
+                        ELSE NULL
+                    END,
+                    now()
+                );
+                """,
+                (
+                    version,
+                    index,
+                    affected_customers,
+                    outage_start,
+                    estimated_restore,
+                    event_type,
+                    status_code,
+                    status_label,
+                    raw_cause_code,
+                    cause_label,
+                    municipality_code,
+                    message_id,
+                    Json(record),
+                    lon,
+                    lat,
+                    lon,
+                    lat,
+                ),
+            )
+
+    conn.commit()
+    return len(outages)
+
+
+def main():
+    version = get_latest_bis_version()
+    outages = fetch_outages(version)
+
+    print(f"Hydro-Québec BIS version: {version}")
+    print(f"Outage records found: {len(outages)}")
+
+    conn = connect()
+    try:
+        init_schema(conn)
+        count = refresh_current_outages(conn, version, outages)
+        print(f"Imported {count} current outage records into PostGIS")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+cat > "$APP_DIR/importers/hydro-quebec/Dockerfile" <<'DOCKERFILE'
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir requests psycopg2-binary
+
+COPY import_hydro_outages.py /app/import_hydro_outages.py
+
+CMD ["python", "/app/import_hydro_outages.py"]
+DOCKERFILE
+
+cat > "$APP_DIR/.env" <<EOF
+POSTGRES_DB=$POSTGRES_DB
+POSTGRES_USER=$POSTGRES_USER
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+GEOSERVER_ADMIN_PASSWORD=$GEOSERVER_ADMIN_PASSWORD
+PGADMIN_EMAIL=$PGADMIN_EMAIL
+PGADMIN_PASSWORD=$PGADMIN_PASSWORD
+GEOSERVER_IMAGE=$GEOSERVER_IMAGE
+POSTGIS_IMAGE=$POSTGIS_IMAGE
+EOF
+
+chmod 600 "$APP_DIR/.env"
+
+echo "=== Writing Docker Compose ==="
+
+cat > "$APP_DIR/docker-compose.yml" <<'EOF'
+services:
+  postgis:
+    image: ${POSTGIS_IMAGE}
+    container_name: opengis-postgis
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgis-data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d
+    networks:
+      - opengis
+
+  geoserver:
+    image: ${GEOSERVER_IMAGE}
+    container_name: opengis-geoserver
+    restart: unless-stopped
+    depends_on:
+      - postgis
+    environment:
+      GEOSERVER_ADMIN_USER: admin
+      GEOSERVER_ADMIN_PASSWORD: ${GEOSERVER_ADMIN_PASSWORD}
+    volumes:
+      - ./geoserver-data:/opt/geoserver_data
+    networks:
+      - opengis
+
+  pg_tileserv:
+    image: pramsey/pg_tileserv:latest-amd64
+    container_name: opengis-pg-tileserv
+    restart: unless-stopped
+    depends_on:
+      - postgis
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgis:5432/${POSTGRES_DB}
+    networks:
+      - opengis
+
+  hydro_importer:
+    build: ./importers/hydro-quebec
+    container_name: opengis-hydro-importer
+    profiles:
+      - importer
+    depends_on:
+      - postgis
+    environment:
+      POSTGRES_HOST: postgis
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: $${POSTGRES_DB}
+      POSTGRES_USER: $${POSTGRES_USER}
+      POSTGRES_PASSWORD: $${POSTGRES_PASSWORD}
+    networks:
+      - opengis
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: opengis-pgadmin
+    restart: unless-stopped
+    profiles:
+      - admin
+    depends_on:
+      - postgis
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      SCRIPT_NAME: /pgadmin
+    volumes:
+      - ./pgadmin-data:/var/lib/pgadmin
+    networks:
+      - opengis
+
+  caddy:
+    image: caddy:2
+    container_name: opengis-caddy
+    restart: unless-stopped
+    depends_on:
+      - geoserver
+      - pg_tileserv
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./www:/usr/share/caddy:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+    networks:
+      - opengis
+
+networks:
+  opengis:
+    name: opengis
+EOF
+
+echo "=== Writing database init script ==="
+
+mkdir -p "$APP_DIR/initdb"
+
+cat > "$APP_DIR/initdb/01-init-spatial.sql" <<'EOF'
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS postgis_topology;
+
+CREATE TABLE IF NOT EXISTS public.sample_points (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    geom geometry(Point, 4326)
+);
+
+INSERT INTO public.sample_points (name, description, geom)
+VALUES
+('Montreal', 'Sample point in Montreal', ST_SetSRID(ST_MakePoint(-73.5673, 45.5017), 4326)),
+('Longueuil', 'Sample point in Longueuil', ST_SetSRID(ST_MakePoint(-73.5107, 45.5312), 4326))
+ON CONFLICT DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS sample_points_geom_idx
+ON public.sample_points
+USING GIST (geom);
+EOF
+
+echo "=== Writing Caddyfile ==="
+
+cat > "$APP_DIR/Caddyfile" <<'EOF'
+{
+    auto_https off
+}
+
+:80 {
+    encode gzip
+
+    handle /geoserver* {
+        reverse_proxy geoserver:8080
+    }
+
+    handle /tiles* {
+        reverse_proxy pg_tileserv:7800
+    }
+
+    handle /pgadmin* {
+        reverse_proxy pgadmin:80
+    }
+
+    handle {
+        root * /usr/share/caddy
+        file_server
+    }
+}
+EOF
+
+echo "=== Writing MapLibre demo frontend ==="
+
+cat > "$APP_DIR/www/index.html" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>OpenGIS Platform</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <link
+    href="https://unpkg.com/maplibre-gl@latest/dist/maplibre-gl.css"
+    rel="stylesheet"
+  />
+
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: white;
+    }
+
+    header {
+      padding: 18px 22px;
+      background: #111827;
+      border-bottom: 1px solid rgba(255,255,255,0.12);
+    }
+
+    header h1 {
+      margin: 0;
+      font-size: 22px;
+    }
+
+    header p {
+      margin: 6px 0 0;
+      opacity: 0.75;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      height: calc(100vh - 82px);
+    }
+
+    aside {
+      padding: 20px;
+      background: #020617;
+      border-right: 1px solid rgba(255,255,255,0.12);
+      overflow: auto;
+    }
+
+    aside h2 {
+      font-size: 16px;
+      margin-top: 0;
+    }
+
+    aside a {
+      color: #93c5fd;
+      text-decoration: none;
+    }
+
+    aside a:hover {
+      text-decoration: underline;
+    }
+
+    .card {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+
+    code {
+      color: #fde68a;
+    }
+
+    #map {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>OpenGIS Platform</h1>
+    <p>Terraform + Docker + PostGIS + GeoServer + pg_tileserv + MapLibre</p>
+  </header>
+
+  <main class="layout">
+    <aside>
+      <div class="card">
+        <h2>Services</h2>
+        <p><a href="/geoserver" target="_blank">GeoServer</a></p>
+        <p><a href="/tiles" target="_blank">pg_tileserv</a></p>
+        <p><a href="/pgadmin" target="_blank">pgAdmin</a></p>
+      </div>
+
+      <div class="card">
+        <h2>PostGIS sample data</h2>
+        <p>Database table:</p>
+        <p><code>public.sample_points</code></p>
+        <p>Contains sample points for Montreal and Longueuil.</p>
+      </div>
+
+      <div class="card">
+        <h2>Next steps</h2>
+        <p>1. Log in to GeoServer.</p>
+        <p>2. Add a PostGIS store using host <code>postgis</code>, port <code>5432</code>.</p>
+        <p>3. Publish <code>sample_points</code> as a WMS/WFS layer.</p>
+      </div>
+    </aside>
+
+    <section id="map"></section>
+  </main>
+
+  <script src="https://unpkg.com/maplibre-gl@latest/dist/maplibre-gl.js"></script>
+  <script>
+    const map = new maplibregl.Map({
+      container: "map",
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: "raster",
+            tiles: [
+              "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png",
+              "https://b.tile.openstreetmap.org/{z}/{x}/{y}.png",
+              "https://c.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            ],
+            tileSize: 256,
+            attribution: "© OpenStreetMap contributors"
+          }
+        },
+        layers: [
+          {
+            id: "osm",
+            type: "raster",
+            source: "osm"
+          }
+        ]
+      },
+      center: [-73.5673, 45.5017],
+      zoom: 10
+    });
+
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+  map.on("load", () => {
+    map.addSource("hydro-outages", {
+      type: "vector",
+      tiles: [
+        window.location.origin + "/tiles/public.hydro_quebec_outages_current/{z}/{x}/{y}.pbf"
+      ],
+      minzoom: 0,
+      maxzoom: 14
+    });
+
+    map.addLayer({
+      id: "hydro-outages-circle",
+      type: "circle",
+      source: "hydro-outages",
+      "source-layer": "public.hydro_quebec_outages_current",
+      paint: {
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["coalesce", ["get", "affected_customers"], 1],
+          1, 5,
+          50, 8,
+          500, 13,
+          2000, 18
+        ],
+        "circle-opacity": 0.75,
+        "circle-stroke-width": 1,
+        "circle-stroke-color": "#ffffff",
+        "circle-color": [
+          "match",
+          ["get", "cause_label"],
+          "Weather conditions", "#38bdf8",
+          "Vegetation damage", "#22c55e",
+          "Animal damage", "#facc15",
+          "Equipment failure", "#f97316",
+          "Accident or incident", "#ef4444",
+          "#a855f7"
+        ]
+      }
+    });
+
+    map.on("click", "hydro-outages-circle", (e) => {
+      const props = e.features[0].properties;
+
+      new maplibregl.Popup()
+        .setLngLat(e.lngLat)
+        .setHTML(
+          "<strong>Hydro-Québec outage</strong><br/>" +
+          "Affected customers: " + (props.affected_customers ?? "Unknown") + "<br/>" +
+          "Status: " + (props.status_label ?? "Unknown") + "<br/>" +
+          "Cause: " + (props.cause_label ?? "Unknown") + "<br/>" +
+          "Started: " + (props.outage_start ?? "Unknown") + "<br/>" +
+          "Estimated restoration: " + (props.estimated_restore ?? "Unknown")
+        )
+        .addTo(map);
+    });
+
+    map.on("mouseenter", "hydro-outages-circle", () => {
+      map.getCanvas().style.cursor = "pointer";
+    });
+
+    map.on("mouseleave", "hydro-outages-circle", () => {
+      map.getCanvas().style.cursor = "";
+    });
+  });
+  </script>
+</body>
+</html>
+EOF
+
+echo "=== Setting permissions ==="
+
+chown -R root:root "$APP_DIR"
+chmod 700 "$APP_DIR"
+chmod 600 "$APP_DIR/.env"
+
+# GeoServer container usually runs as non-root in some images; keep data writable for lab simplicity.
+chmod -R 777 "$APP_DIR/geoserver-data" "$APP_DIR/pgadmin-data" "$APP_DIR/caddy-data" "$APP_DIR/caddy-config"
+
+echo "=== Starting Docker Compose stack ==="
+
+cd "$APP_DIR"
+
+if [[ "$ENABLE_PGADMIN" == "true" ]]; then
+  docker compose --profile admin up -d
+else
+  docker compose up -d
+fi
+
+echo "=== Waiting for containers ==="
+
+sleep 30
+docker compose ps
+
+echo "=== Running initial Hydro-Québec outage import ==="
+
+for i in $(seq 1 30); do
+  if docker compose exec -T postgis pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"; then
+    echo "PostGIS is ready"
+    break
+  fi
+
+  echo "Waiting for PostGIS... attempt $i"
+  sleep 10
+done
+
+docker compose --profile importer build hydro_importer
+docker compose --profile importer run --rm hydro_importer || true
+
+echo "=== Installing Hydro-Québec outage import cron job ==="
+
+cat > /usr/local/bin/import-hydro-quebec-outages <<'IMPORTER_RUNNER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /opt/opengis
+
+/usr/bin/docker compose --profile importer run --rm hydro_importer \
+  >> /var/log/hydro-quebec-outages-import.log 2>&1
+IMPORTER_RUNNER
+
+chmod +x /usr/local/bin/import-hydro-quebec-outages
+
+cat > /etc/cron.d/hydro-quebec-outages <<'CRON'
+*/15 * * * * root /usr/local/bin/import-hydro-quebec-outages
+CRON
+
+chmod 644 /etc/cron.d/hydro-quebec-outages
+
+echo "=== Auto-publishing Hydro-Québec layer in GeoServer ==="
+
+for i in $(seq 1 60); do
+  if curl -fsS -u "admin:$GEOSERVER_ADMIN_PASSWORD" "http://localhost/geoserver/rest/about/version.xml" >/dev/null 2>&1; then
+    echo "GeoServer REST API is ready"
+    break
+  fi
+
+  echo "Waiting for GeoServer REST API... attempt $i"
+  sleep 10
+done
+
+curl -fsS -u "admin:$GEOSERVER_ADMIN_PASSWORD" \
+  -XPOST \
+  -H "Content-Type: application/json" \
+  -d '{"workspace":{"name":"hydro"}}' \
+  "http://localhost/geoserver/rest/workspaces" || true
+
+curl -fsS -u "admin:$GEOSERVER_ADMIN_PASSWORD" \
+  -XPOST \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"dataStore\": {
+      \"name\": \"postgis\",
+      \"connectionParameters\": {
+        \"host\": \"postgis\",
+        \"port\": \"5432\",
+        \"database\": \"$POSTGRES_DB\",
+        \"schema\": \"public\",
+        \"user\": \"$POSTGRES_USER\",
+        \"passwd\": \"$POSTGRES_PASSWORD\",
+        \"dbtype\": \"postgis\"
+      }
+    }
+  }" \
+  "http://localhost/geoserver/rest/workspaces/hydro/datastores" || true
+
+curl -fsS -u "admin:$GEOSERVER_ADMIN_PASSWORD" \
+  -XPOST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "featureType": {
+      "name": "hydro_quebec_outages_current",
+      "nativeName": "hydro_quebec_outages_current",
+      "title": "Hydro-Québec Current Outages",
+      "srs": "EPSG:4326"
+    }
+  }' \
+  "http://localhost/geoserver/rest/workspaces/hydro/datastores/postgis/featuretypes" || true
+
+cat > /etc/motd <<EOF
+OpenGIS platform deployed.
+
+App directory:
+$APP_DIR
+
+URLs:
+http://$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || hostname -f)/
+http://$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || hostname -f)/geoserver
+http://$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || hostname -f)/tiles
+http://$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || hostname -f)/pgadmin
+
+Logs:
+sudo tail -f /var/log/opengis-bootstrap.log
+cd /opt/opengis && sudo docker compose logs -f
+EOF
+
+echo "=== OpenGIS Terraform bootstrap completed ==="
+date

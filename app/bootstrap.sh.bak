@@ -1,0 +1,1679 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee /var/log/opengis-bootstrap.log | logger -t opengis-bootstrap -s 2>/dev/console) 2>&1
+
+APP_DIR="/opt/opengis"
+
+source "$APP_DIR/.env"
+
+echo "=== OpenGIS bootstrap started ==="
+date
+
+echo "=== Installing packages ==="
+
+echo "=== Installing packages ==="
+# Clean up any broken Docker repo left from previous failed runs.
+rm -f /etc/apt/sources.list.d/docker.sources
+rm -f /etc/apt/sources.list.d/docker.list
+rm -f /etc/apt/keyrings/docker.gpg
+rm -f /etc/apt/keyrings/docker.asc
+
+apt-get update -y
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  ca-certificates \
+  curl \
+  gnupg \
+  lsb-release \
+  unzip \
+  jq \
+  awscli
+
+install -m 0755 -d /etc/apt/keyrings
+
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+UBUNTU_CODENAME="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME}}")"
+
+cat > /etc/apt/sources.list.d/docker.sources <<EOF_DOCKER_REPO
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${UBUNTU_CODENAME}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.gpg
+EOF_DOCKER_REPO
+
+apt-get update -y
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  docker-ce \
+  docker-ce-cli \
+  containerd.io \
+  docker-buildx-plugin \
+  docker-compose-plugin
+
+systemctl enable --now docker
+
+echo "=== Creating app directories ==="
+
+mkdir -p "$APP_DIR"
+mkdir -p "$APP_DIR/www"
+mkdir -p "$APP_DIR/geoserver-data"
+mkdir -p "$APP_DIR/postgis-data"
+mkdir -p "$APP_DIR/pgadmin-data"
+mkdir -p "$APP_DIR/caddy-data"
+mkdir -p "$APP_DIR/caddy-config"
+mkdir -p "$APP_DIR/importers/hydro-quebec"
+
+echo "=== Writing Hydro-Québec outage importer ==="
+
+cat > "$APP_DIR/importers/hydro-quebec/import_hydro_outages.py" <<'PYTHON'
+#!/usr/bin/env python3
+import json
+import os
+import re
+from typing import Any, Optional, Tuple
+import hashlib
+
+import psycopg2
+from psycopg2.extras import Json
+import requests
+
+
+BIS_VERSION_URL = "https://pannes.hydroquebec.com/pannes/donnees/v3_0/bisversion.json"
+BIS_MARKERS_URL = "https://pannes.hydroquebec.com/pannes/donnees/v3_0/bismarkers{version}.json"
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgis")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "gis")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "gisuser")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+
+
+STATUS_MAP = {
+    "A": "Work assigned",
+    "L": "Crew at work",
+    "R": "Crew en route",
+    "": "Unknown",
+}
+
+CAUSE_MAP = {
+    "11": "Equipment failure",
+    "12": "Equipment failure",
+    "13": "Equipment failure",
+    "14": "Equipment failure",
+    "15": "Equipment failure",
+    "58": "Equipment failure",
+    "70": "Equipment failure",
+    "72": "Equipment failure",
+    "73": "Equipment failure",
+    "74": "Equipment failure",
+    "79": "Equipment failure",
+    "21": "Weather conditions",
+    "22": "Weather conditions",
+    "24": "Weather conditions",
+    "25": "Weather conditions",
+    "26": "Weather conditions",
+    "31": "Accident or incident",
+    "32": "Accident or incident",
+    "33": "Accident or incident",
+    "34": "Accident or incident",
+    "41": "Accident or incident",
+    "42": "Accident or incident",
+    "43": "Accident or incident",
+    "44": "Accident or incident",
+    "54": "Accident or incident",
+    "55": "Accident or incident",
+    "56": "Accident or incident",
+    "57": "Accident or incident",
+    "51": "Vegetation damage",
+    "52": "Animal damage",
+    "53": "Animal damage",
+}
+
+def get_latest_bis_version() -> str:
+    response = requests.get(BIS_VERSION_URL, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+    text = json.dumps(data)
+
+    match = re.search(r"\d{14}", text)
+    if not match:
+        raise RuntimeError(f"Could not find BIS version in response: {data}")
+
+    return match.group(0)
+
+
+def fetch_outages(version: str) -> list:
+    url = BIS_MARKERS_URL.format(version=version)
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+    return data.get("pannes", [])
+
+def parse_point(value: Any) -> Optional[Tuple[float, float]]:
+    if not value:
+        return None
+
+    try:
+        lon, lat = json.loads(value)
+        return float(lon), float(lat)
+    except Exception:
+        return None
+
+def severity_label(customers):
+    customers = customers or 0
+
+    if customers >= 200:
+        return "Critical"
+    if customers >= 50:
+        return "High"
+    if customers >= 10:
+        return "Medium"
+    if customers >= 1:
+        return "Low"
+
+    return "Unknown"
+
+def stable_outage_uid(message_id, outage_start, lon, lat, affected_customers, municipality_code):
+    if message_id:
+        return f"message:{message_id}"
+
+    material = json.dumps(
+        {
+            "outage_start": outage_start,
+            "lon": round(float(lon), 6) if lon is not None else None,
+            "lat": round(float(lat), 6) if lat is not None else None,
+            "affected_customers": affected_customers,
+            "municipality_code": municipality_code,
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+    return "hash:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+def connect():
+    if not POSTGRES_PASSWORD:
+        raise RuntimeError("POSTGRES_PASSWORD environment variable is required")
+
+    return psycopg2.connect(
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+    )
+
+
+def init_schema(conn):
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public.hydro_quebec_outages_current (
+                outage_uid TEXT PRIMARY KEY,
+                source_version TEXT NOT NULL,
+                source_index INTEGER NOT NULL,
+                affected_customers INTEGER,
+                severity_label TEXT,
+                outage_start TIMESTAMP,
+                estimated_restore TIMESTAMP,
+                event_type TEXT,
+                status_code TEXT,
+                status_label TEXT,
+                raw_cause_code TEXT,
+                cause_label TEXT,
+                municipality_code TEXT,
+                message_id TEXT,
+                raw_record JSONB NOT NULL,
+                geom geometry(Point, 4326),
+                imported_at TIMESTAMP NOT NULL DEFAULT now()
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS hydro_quebec_outages_current_geom_idx
+            ON public.hydro_quebec_outages_current
+            USING GIST (geom);
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS hydro_quebec_outages_current_imported_at_idx
+            ON public.hydro_quebec_outages_current (imported_at);
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public.hydro_quebec_import_runs (
+                id BIGSERIAL PRIMARY KEY,
+                source_version TEXT NOT NULL,
+                fetched_at TIMESTAMP NOT NULL DEFAULT now(),
+                records_found INTEGER NOT NULL,
+                records_imported INTEGER NOT NULL DEFAULT 0,
+                success BOOLEAN NOT NULL DEFAULT false,
+                error_message TEXT
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public.hydro_quebec_outages_history (
+                outage_uid TEXT PRIMARY KEY,
+                first_seen TIMESTAMP NOT NULL DEFAULT now(),
+                last_seen TIMESTAMP NOT NULL DEFAULT now(),
+                cleared_at TIMESTAMP,
+                seen_count INTEGER NOT NULL DEFAULT 1,
+                latest_source_version TEXT,
+                affected_customers INTEGER,
+                severity_label TEXT,
+                outage_start TIMESTAMP,
+                estimated_restore TIMESTAMP,
+                event_type TEXT,
+                status_code TEXT,
+                status_label TEXT,
+                raw_cause_code TEXT,
+                cause_label TEXT,
+                municipality_code TEXT,
+                message_id TEXT,
+                raw_record JSONB NOT NULL,
+                geom geometry(Point, 4326)
+            );
+            """
+        )
+
+    conn.commit()
+
+
+def refresh_current_outages(conn, version: str, outages: list) -> int:
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE TABLE public.hydro_quebec_outages_current;")
+
+        for index, record in enumerate(outages):
+            affected_customers = record[0] if len(record) > 0 else None
+            outage_start = record[1] if len(record) > 1 else None
+            estimated_restore = record[2] if len(record) > 2 else None
+            event_type = record[3] if len(record) > 3 else None
+            point = parse_point(record[4]) if len(record) > 4 else None
+            status_code = record[5] if len(record) > 5 else ""
+            raw_cause_code = record[7] if len(record) > 7 else ""
+            municipality_code = record[8] if len(record) > 8 else ""
+            message_id = record[9] if len(record) > 9 else ""
+
+            status_label = STATUS_MAP.get(str(status_code), "Unknown")
+            cause_label = CAUSE_MAP.get(str(raw_cause_code), "Unknown")
+
+            lon = point[0] if point else None
+            lat = point[1] if point else None
+
+            cur.execute(
+                """
+                INSERT INTO public.hydro_quebec_outages_current (
+                    source_version,
+                    source_index,
+                    affected_customers,
+                    outage_start,
+                    estimated_restore,
+                    event_type,
+                    status_code,
+                    status_label,
+                    raw_cause_code,
+                    cause_label,
+                    municipality_code,
+                    message_id,
+                    raw_record,
+                    geom,
+                    imported_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    NULLIF(%s, '')::timestamp,
+                    NULLIF(%s, '')::timestamp,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    CASE
+                        WHEN %s IS NOT NULL AND %s IS NOT NULL
+                        THEN ST_SetSRID(ST_MakePoint(%s, %s), 4326)
+                        ELSE NULL
+                    END,
+                    now()
+                );
+                """,
+                (
+                    version,
+                    index,
+                    affected_customers,
+                    outage_start,
+                    estimated_restore,
+                    event_type,
+                    status_code,
+                    status_label,
+                    raw_cause_code,
+                    cause_label,
+                    municipality_code,
+                    message_id,
+                    Json(record),
+                    lon,
+                    lat,
+                    lon,
+                    lat,
+                ),
+            )
+
+    conn.commit()
+    return len(outages)
+
+
+def main():
+    version = get_latest_bis_version()
+    outages = fetch_outages(version)
+
+    print(f"Hydro-Québec BIS version: {version}")
+    print(f"Outage records found: {len(outages)}")
+
+    conn = connect()
+    try:
+        init_schema(conn)
+        count = refresh_current_outages(conn, version, outages)
+        print(f"Imported {count} current outage records into PostGIS")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+cat > "$APP_DIR/importers/hydro-quebec/Dockerfile" <<'DOCKERFILE'
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir requests psycopg2-binary
+
+COPY import_hydro_outages.py /app/import_hydro_outages.py
+
+CMD ["python", "/app/import_hydro_outages.py"]
+DOCKERFILE
+
+cat > "$APP_DIR/.env" <<EOF
+POSTGRES_DB=$POSTGRES_DB
+POSTGRES_USER=$POSTGRES_USER
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+GEOSERVER_ADMIN_PASSWORD=$GEOSERVER_ADMIN_PASSWORD
+PGADMIN_EMAIL=$PGADMIN_EMAIL
+PGADMIN_PASSWORD=$PGADMIN_PASSWORD
+GEOSERVER_IMAGE=$GEOSERVER_IMAGE
+POSTGIS_IMAGE=$POSTGIS_IMAGE
+ENABLE_PGADMIN='true'
+EOF
+
+chmod 600 "$APP_DIR/.env"
+
+echo "=== Writing Docker Compose ==="
+
+cat > "$APP_DIR/docker-compose.yml" <<'EOF'
+services:
+  postgis:
+    image: ${POSTGIS_IMAGE}
+    container_name: opengis-postgis
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgis-data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d
+    networks:
+      - opengis
+
+  geoserver:
+    image: ${GEOSERVER_IMAGE}
+    container_name: opengis-geoserver
+    restart: unless-stopped
+    depends_on:
+      - postgis
+    environment:
+      GEOSERVER_ADMIN_USER: admin
+      GEOSERVER_ADMIN_PASSWORD: ${GEOSERVER_ADMIN_PASSWORD}
+    volumes:
+      - ./geoserver-data:/opt/geoserver_data
+    networks:
+      - opengis
+
+  pg_tileserv:
+    image: pramsey/pg_tileserv:latest-amd64
+    container_name: opengis-pg-tileserv
+    restart: unless-stopped
+    depends_on:
+      - postgis
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgis:5432/${POSTGRES_DB}
+    networks:
+      - opengis
+
+  pg_featureserv:
+    image: pramsey/pg_featureserv:latest
+    container_name: opengis-pg-featureserv
+    restart: unless-stopped
+    depends_on:
+      - postgis
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgis:5432/${POSTGRES_DB}"
+    networks:
+      - opengis
+
+  hydro_importer:
+    build: ./importers/hydro-quebec
+    container_name: opengis-hydro-importer
+    profiles:
+      - importer
+    depends_on:
+      - postgis
+    environment:
+      POSTGRES_HOST: postgis
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    networks:
+      - opengis
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: opengis-pgadmin
+    restart: unless-stopped
+    profiles:
+      - admin
+    depends_on:
+      - postgis
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      SCRIPT_NAME: /pgadmin
+    volumes:
+      - ./pgadmin-data:/var/lib/pgadmin
+    networks:
+      - opengis
+
+  caddy:
+    image: caddy:2
+    container_name: opengis-caddy
+    restart: unless-stopped
+    depends_on:
+      - geoserver
+      - pg_tileserv
+      - pg_featureserv
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./www:/usr/share/caddy:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+    networks:
+      - opengis
+
+networks:
+  opengis:
+    name: opengis
+EOF
+
+echo "=== Writing database init script ==="
+
+mkdir -p "$APP_DIR/initdb"
+
+cat > "$APP_DIR/initdb/01-init-spatial.sql" <<'EOF'
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS postgis_topology;
+
+CREATE TABLE IF NOT EXISTS public.sample_points (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    geom geometry(Point, 4326)
+);
+
+INSERT INTO public.sample_points (name, description, geom)
+VALUES
+('Montreal', 'Sample point in Montreal', ST_SetSRID(ST_MakePoint(-73.5673, 45.5017), 4326)),
+('Longueuil', 'Sample point in Longueuil', ST_SetSRID(ST_MakePoint(-73.5107, 45.5312), 4326))
+ON CONFLICT DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS sample_points_geom_idx
+ON public.sample_points
+USING GIST (geom);
+EOF
+
+echo "=== Writing Caddyfile ==="
+
+cat > "$APP_DIR/Caddyfile" <<'EOF'
+{
+    auto_https off
+}
+
+:80 {
+    encode gzip
+
+    handle /geoserver* {
+        reverse_proxy geoserver:8080
+    }
+
+    handle_path /tiles* {
+        reverse_proxy pg_tileserv:7800
+    }
+
+    handle_path /features* {
+        reverse_proxy pg_featureserv:9000
+    }
+
+    handle /pgadmin* {
+        reverse_proxy pgadmin:80
+    }
+
+    handle {
+        root * /usr/share/caddy
+        file_server
+    }
+}
+EOF
+
+echo "=== Writing MapLibre demo frontend ==="
+
+cat > "$APP_DIR/www/index.html" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>OpenGIS Platform</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <link
+    href="https://unpkg.com/maplibre-gl@latest/dist/maplibre-gl.css"
+    rel="stylesheet"
+  />
+
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: white;
+    }
+
+    header {
+      padding: 18px 22px;
+      background: #111827;
+      border-bottom: 1px solid rgba(255,255,255,0.12);
+    }
+
+    header h1 {
+      margin: 0;
+      font-size: 22px;
+    }
+
+    header p {
+      margin: 6px 0 0;
+      opacity: 0.75;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      height: calc(100vh - 82px);
+    }
+
+    aside {
+      padding: 20px;
+      background: #020617;
+      border-right: 1px solid rgba(255,255,255,0.12);
+      overflow: auto;
+    }
+
+    aside h2 {
+      font-size: 16px;
+      margin-top: 0;
+    }
+
+    aside a {
+      color: #93c5fd;
+      text-decoration: none;
+    }
+
+    aside a:hover {
+      text-decoration: underline;
+    }
+
+    .card {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+
+    code {
+      color: #fde68a;
+    }
+
+    #map {
+      width: 100%;
+      height: 100%;
+    }
+
+    .maplibregl-popup-content {
+      color: #111827;
+      font-size: 14px;
+      line-height: 1.4;
+      border-radius: 12px;
+      padding: 14px 16px;
+      max-width: 320px;
+    }
+
+    .maplibregl-popup-content strong {
+      color: #0f172a;
+      font-size: 15px;
+    }
+
+    .maplibregl-popup-close-button {
+      color: #111827;
+      font-size: 20px;
+      padding: 4px 8px;
+    }
+
+    .hydro-popup {
+      color: #111827;
+    }
+
+    .hydro-popup strong {
+      display: inline-block;
+      margin-bottom: 6px;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .stat {
+      background: rgba(59, 130, 246, 0.12);
+      border: 1px solid rgba(147, 197, 253, 0.18);
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .stat span {
+      display: block;
+      font-size: 24px;
+      font-weight: 800;
+      color: #93c5fd;
+    }
+
+    .stat small {
+      display: block;
+      margin-top: 4px;
+      color: rgba(255,255,255,0.72);
+    }
+
+    label {
+      display: block;
+      margin-top: 12px;
+      margin-bottom: 6px;
+      color: rgba(255,255,255,0.8);
+      font-size: 13px;
+    }
+
+    select,
+    button {
+      width: 100%;
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 10px;
+      padding: 9px 10px;
+      background: #111827;
+      color: white;
+      margin-bottom: 8px;
+    }
+
+    button {
+      cursor: pointer;
+      background: #2563eb;
+      border-color: #3b82f6;
+      font-weight: 700;
+    }
+
+    button:hover {
+      background: #1d4ed8;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 8px 0;
+      color: rgba(255,255,255,0.85);
+    }
+
+    .legend-item span {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      border: 2px solid white;
+    }
+
+    .outage-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .outage-item {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 10px;
+      cursor: pointer;
+    }
+
+    .outage-item:hover {
+      background: rgba(59, 130, 246, 0.18);
+    }
+
+    .outage-item strong {
+      display: block;
+      color: #ffffff;
+    }
+
+    .outage-item small {
+      display: block;
+      margin-top: 4px;
+      color: rgba(255,255,255,0.65);
+    }
+
+    .muted {
+      color: rgba(255,255,255,0.6);
+    }
+
+    .maplibregl-popup-content {
+      color: #111827;
+      font-size: 14px;
+      line-height: 1.4;
+      border-radius: 12px;
+      padding: 14px 16px;
+      max-width: 320px;
+    }
+
+    .maplibregl-popup-content strong {
+      color: #0f172a;
+      font-size: 15px;
+    }
+
+    .hydro-popup {
+      color: #111827;
+    }
+
+    .hydro-popup strong {
+      display: inline-block;
+      margin-bottom: 6px;
+    }
+
+
+    .health-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 8px 0;
+      color: rgba(255,255,255,0.65);
+      font-size: 13px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.07);
+    }
+
+    .pill.healthy {
+      color: #86efac;
+    }
+
+    .pill.error {
+      color: #fca5a5;
+    }
+
+    .pill.loading {
+      color: #fde68a;
+    }
+
+    .severity {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 3px 8px;
+      margin-top: 7px;
+      font-size: 11px;
+      font-weight: 800;
+      color: #0f172a;
+    }
+
+    .severity.Low {
+      background: #93c5fd;
+    }
+
+    .severity.Medium {
+      background: #facc15;
+    }
+
+    .severity.High {
+      background: #fb923c;
+    }
+
+    .severity.Critical {
+      background: #ef4444;
+      color: white;
+    }
+
+    .severity.Unknown {
+      background: #c4b5fd;
+    }
+
+    .chart {
+      width: 100% !important;
+      max-height: 190px;
+      margin-top: 10px;
+    }
+
+    .button-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>OpenGIS Platform</h1>
+    <p>Terraform + Docker + PostGIS + GeoServer + pg_tileserv + MapLibre</p>
+  </header>
+
+  <main class="layout">
+  <aside>
+    <div class="card">
+      <h2>Hydro-Québec Dashboard</h2>
+      <div class="stats-grid">
+        <div class="stat">
+          <span id="stat-outages">0</span>
+          <small>Current outages</small>
+        </div>
+        <div class="stat">
+          <span id="stat-customers">0</span>
+          <small>Customers affected</small>
+        </div>
+        <div class="stat">
+          <span id="stat-crews">0</span>
+          <small>Crews active</small>
+        </div>
+        <div class="stat">
+          <span id="stat-updated">--</span>
+          <small>Last refresh</small>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Controls</h2>
+
+      <label>Jump to city</label>
+      <select id="city-zoom">
+        <option value="">Choose a city...</option>
+        <option value="-73.5673,45.5017,10">Montréal</option>
+        <option value="-73.5107,45.5312,11">Longueuil</option>
+        <option value="-71.2080,46.8139,10">Québec City</option>
+        <option value="-75.6972,45.4765,10">Gatineau</option>
+        <option value="-71.8929,45.4042,10">Sherbrooke</option>
+        <option value="-68.5360,48.4489,10">Rimouski</option>
+      </select>
+
+      <label>Cause</label>
+      <select id="filter-cause">
+        <option value="all">All causes</option>
+        <option value="Weather conditions">Weather conditions</option>
+        <option value="Vegetation damage">Vegetation damage</option>
+        <option value="Animal damage">Animal damage</option>
+        <option value="Equipment failure">Equipment failure</option>
+        <option value="Accident or incident">Accident or incident</option>
+        <option value="Unknown">Unknown</option>
+      </select>
+
+      <label>Status</label>
+      <select id="filter-status">
+        <option value="all">All statuses</option>
+        <option value="Work assigned">Work assigned</option>
+        <option value="Crew en route">Crew en route</option>
+        <option value="Crew at work">Crew at work</option>
+        <option value="Unknown">Unknown</option>
+      </select>
+
+      <label>Minimum affected customers</label>
+      <select id="filter-min-customers">
+        <option value="0">All</option>
+        <option value="1">1+</option>
+        <option value="10">10+</option>
+        <option value="50">50+</option>
+        <option value="100">100+</option>
+      </select>
+
+      <div class="button-grid">
+        <button id="zoom-outages">Zoom to all</button>
+        <button id="refresh-outages">Refresh</button>
+        <button id="toggle-heatmap">Heatmap</button>
+        <button id="toggle-clusters">Clusters</button>
+        <button id="export-csv">Export CSV</button>
+        <button id="export-geojson">Export GeoJSON</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Legend</h2>
+      <div class="legend-item"><span style="background:#38bdf8"></span> Weather conditions</div>
+      <div class="legend-item"><span style="background:#22c55e"></span> Vegetation damage</div>
+      <div class="legend-item"><span style="background:#facc15"></span> Animal damage</div>
+      <div class="legend-item"><span style="background:#f97316"></span> Equipment failure</div>
+      <div class="legend-item"><span style="background:#ef4444"></span> Accident or incident</div>
+      <div class="legend-item"><span style="background:#a855f7"></span> Unknown</div>
+    </div>
+
+    <div class="card">
+      <h2>Current Outages</h2>
+      <div id="outage-list" class="outage-list">
+        <p class="muted">Loading outages...</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Services</h2>
+      <p><a href="/geoserver" target="_blank">GeoServer</a></p>
+      <p><a href="/tiles" target="_blank">pg_tileserv</a></p>
+      <p><a href="/features" target="_blank">pg_featureserv</a></p>
+      <p><a href="/pgadmin" target="_blank">pgAdmin</a></p>
+    </div>
+
+    <div class="card">
+      <h2>Pipeline Status</h2>
+      <div class="health-row">
+        <span>Frontend API</span>
+        <span id="api-health" class="pill loading">Checking</span>
+      </div>
+      <div class="health-row">
+        <span>Last imported</span>
+        <span id="last-imported">--</span>
+      </div>
+      <div class="health-row">
+        <span>Next frontend refresh</span>
+        <span id="next-refresh">--</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Charts</h2>
+      <canvas id="cause-chart" class="chart"></canvas>
+      <canvas id="status-chart" class="chart"></canvas>
+    </div>
+  </aside>
+
+    <section id="map"></section>
+  </main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://unpkg.com/maplibre-gl@latest/dist/maplibre-gl.js"></script>
+<script>
+  let outageData = {
+    type: "FeatureCollection",
+    features: []
+  };
+
+  let heatmapVisible = false;
+  let clustersVisible = false;
+  let nextRefreshAt = null;
+  let causeChart = null;
+  let statusChart = null;
+
+  const map = new maplibregl.Map({
+    container: "map",
+    style: {
+      version: 8,
+      sources: {
+        osm: {
+          type: "raster",
+          tiles: [
+            "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "https://b.tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "https://c.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          ],
+          tileSize: 256,
+          attribution: "© OpenStreetMap contributors"
+        }
+      },
+      layers: [
+        {
+          id: "osm",
+          type: "raster",
+          source: "osm"
+        }
+      ]
+    },
+    center: [-73.5673, 45.5017],
+    zoom: 10
+  });
+
+  map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+  let outageData = {
+    type: "FeatureCollection",
+    features: []
+  };
+
+  let heatmapVisible = false;
+
+  function getFilters() {
+    return {
+      cause: document.getElementById("filter-cause").value,
+      status: document.getElementById("filter-status").value,
+      minCustomers: Number(document.getElementById("filter-min-customers").value)
+    };
+  }
+
+  function featureCustomers(feature) {
+    return Number(feature.properties.affected_customers || 0);
+  }
+
+  function featurePassesFilters(feature) {
+    const filters = getFilters();
+    const props = feature.properties || {};
+
+    if (filters.cause !== "all" && props.cause_label !== filters.cause) {
+      return false;
+    }
+
+    if (filters.status !== "all" && props.status_label !== filters.status) {
+      return false;
+    }
+
+    if (featureCustomers(feature) < filters.minCustomers) {
+      return false;
+    }
+
+    return true;
+  }
+
+  function filteredOutages() {
+    return outageData.features.filter(featurePassesFilters);
+  }
+
+  function updateMapData() {
+    const filtered = {
+      type: "FeatureCollection",
+      features: filteredOutages()
+    };
+
+    const source = map.getSource("hydro-outages");
+    if (source) {
+      source.setData(filtered);
+    }
+  }
+
+  function updateSummary() {
+    const features = filteredOutages();
+
+    const customers = features.reduce(
+      (sum, feature) => sum + featureCustomers(feature),
+      0
+    );
+
+    const crews = features.filter(feature =>
+      ["Crew at work", "Crew en route", "Work assigned"].includes(
+        feature.properties.status_label
+      )
+    ).length;
+
+    document.getElementById("stat-outages").textContent = features.length;
+    document.getElementById("stat-customers").textContent = customers;
+    document.getElementById("stat-crews").textContent = crews;
+    document.getElementById("stat-updated").textContent =
+      new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit"
+      });
+  }
+
+  function popupHtml(props) {
+    return (
+      '<div class="hydro-popup">' +
+        '<strong>Hydro-Québec outage</strong><br/>' +
+        'Affected customers: ' + (props.affected_customers ?? "Unknown") + '<br/>' +
+        'Status: ' + (props.status_label ?? "Unknown") + '<br/>' +
+        'Cause: ' + (props.cause_label ?? "Unknown") + '<br/>' +
+        'Started: ' + (props.outage_start ?? "Unknown") + '<br/>' +
+        'Estimated restoration: ' + (props.estimated_restore ?? "Unknown") +
+      '</div>'
+    );
+  }
+
+  function severityFromCustomers(customers) {
+    if (customers >= 200) return "Critical";
+    if (customers >= 50) return "High";
+    if (customers >= 10) return "Medium";
+    if (customers >= 1) return "Low";
+    return "Unknown";
+  }
+
+  function renderOutageList() {
+    const container = document.getElementById("outage-list");
+
+    const features = filteredOutages()
+      .slice()
+      .sort((a, b) => featureCustomers(b) - featureCustomers(a));
+
+    if (!features.length) {
+      container.innerHTML = '<p class="muted">No outages match the current filters.</p>';
+      return;
+    }
+
+    container.innerHTML = "";
+
+    features.forEach(feature => {
+      const props = feature.properties || {};
+      const coords = feature.geometry.coordinates;
+      const severity = props.severity_label || severityFromCustomers(featureCustomers(feature));
+
+      const item = document.createElement("div");
+      item.className = "outage-item";
+      item.innerHTML =
+        "<strong>" + featureCustomers(feature) + " customers affected</strong>" +
+        "<small>Status: " + (props.status_label ?? "Unknown") + "</small>" +
+        "<small>Cause: " + (props.cause_label ?? "Unknown") + "</small>" +
+        '<span class="severity ' + severity + '">' + severity + '</span>';
+
+      item.addEventListener("click", () => {
+        map.flyTo({
+          center: coords,
+          zoom: 12,
+          speed: 1.2
+        });
+
+        new maplibregl.Popup()
+          .setLngLat(coords)
+          .setHTML(popupHtml(props))
+          .addTo(map);
+      });
+
+      container.appendChild(item);
+    });
+  }
+
+  function refreshDashboard() {
+    updateMapData();
+    updateSummary();
+    renderOutageList();
+  }
+
+  async function loadOutages() {
+    setHealth("loading", "Loading");
+
+    const url =
+      window.location.origin +
+      "/features/collections/public.hydro_quebec_outages_current/items.json?limit=1000";
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("Hydro response error:", errorText);
+      setHealth("error", "API error");
+      throw new Error("Could not load Hydro-Québec outages: " + response.status);
+    }
+
+    const data = await response.json();
+
+    outageData = data.features ? data : {
+      type: "FeatureCollection",
+      features: []
+    };
+
+    setHealth("healthy", "Healthy");
+    nextRefreshAt = Date.now() + 5 * 60 * 1000;
+
+    refreshDashboard();
+  }
+
+  function setHealth(status, message) {
+    const api = document.getElementById("api-health");
+    api.className = "pill " + status;
+    api.textContent = message;
+  }
+
+  function updateRefreshCountdown() {
+    if (!nextRefreshAt) {
+      document.getElementById("next-refresh").textContent = "--";
+      return;
+    }
+
+    const seconds = Math.max(0, Math.floor((nextRefreshAt - Date.now()) / 1000));
+    const minutes = Math.floor(seconds / 60);
+    const rest = String(seconds % 60).padStart(2, "0");
+
+    document.getElementById("next-refresh").textContent = minutes + ":" + rest;
+  }
+
+  function zoomToAllOutages() {
+    const features = filteredOutages();
+
+    if (!features.length) {
+      return;
+    }
+
+    let minLon = Infinity;
+    let minLat = Infinity;
+    let maxLon = -Infinity;
+    let maxLat = -Infinity;
+
+    features.forEach(feature => {
+      const [lon, lat] = feature.geometry.coordinates;
+      minLon = Math.min(minLon, lon);
+      minLat = Math.min(minLat, lat);
+      maxLon = Math.max(maxLon, lon);
+      maxLat = Math.max(maxLat, lat);
+    });
+
+    map.fitBounds(
+      [
+        [minLon, minLat],
+        [maxLon, maxLat]
+      ],
+      {
+        padding: 80,
+        maxZoom: 11
+      }
+    );
+  }
+
+  function setupControls() {
+    document.getElementById("filter-cause").addEventListener("change", refreshDashboard);
+    document.getElementById("filter-status").addEventListener("change", refreshDashboard);
+    document.getElementById("filter-min-customers").addEventListener("change", refreshDashboard);
+    
+
+    document.getElementById("zoom-outages").addEventListener("click", zoomToAllOutages);
+    document.getElementById("refresh-outages").addEventListener("click", loadOutages);
+    document.getElementById("export-csv").addEventListener("click", exportCsv);
+    document.getElementById("export-geojson").addEventListener("click", exportGeoJson);
+
+    document.getElementById("city-zoom").addEventListener("change", (event) => {
+      if (!event.target.value) return;
+
+      const [lon, lat, zoom] = event.target.value.split(",").map(Number);
+
+      map.flyTo({
+        center: [lon, lat],
+        zoom
+      });
+    });
+
+    document.getElementById("toggle-heatmap").addEventListener("click", () => {
+      heatmapVisible = !heatmapVisible;
+
+      map.setLayoutProperty(
+        "hydro-outages-heatmap",
+        "visibility",
+        heatmapVisible ? "visible" : "none"
+      );
+
+      map.setLayoutProperty(
+        "hydro-outages-circle",
+        "visibility",
+        heatmapVisible ? "none" : "visible"
+      );
+    });
+  }
+
+  map.addLayer({
+    id: "hydro-outages-clusters",
+    type: "circle",
+    source: "hydro-outages",
+    layout: {
+      visibility: "none"
+    },
+    filter: ["has", "point_count"],
+    paint: {
+      "circle-color": "#2563eb",
+      "circle-radius": [
+        "step",
+        ["get", "point_count"],
+        18,
+        10,
+        24,
+        50,
+        32
+      ],
+      "circle-stroke-color": "#ffffff",
+      "circle-stroke-width": 2
+    }
+  });
+
+  map.addLayer({
+    id: "hydro-outages-cluster-count",
+    type: "symbol",
+    source: "hydro-outages",
+    layout: {
+      visibility: "none",
+      "text-field": ["get", "point_count_abbreviated"],
+      "text-size": 13
+    },
+    filter: ["has", "point_count"],
+    paint: {
+      "text-color": "#ffffff"
+    }
+  });
+
+    map.addLayer({
+      id: "hydro-outages-circle",
+      type: "circle",
+      source: "hydro-outages",
+      filter: ["!", ["has", "point_count"]],
+      paint: {
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["coalesce", ["get", "affected_customers"], 1],
+          1, 6,
+          10, 9,
+          50, 13,
+          100, 18
+        ],
+        "circle-color": [
+          "match",
+          ["get", "cause_label"],
+          "Weather conditions", "#38bdf8",
+          "Vegetation damage", "#22c55e",
+          "Animal damage", "#facc15",
+          "Equipment failure", "#f97316",
+          "Accident or incident", "#ef4444",
+          "#a855f7"
+        ],
+        "circle-stroke-color": "#ffffff",
+        "circle-stroke-width": 2,
+        "circle-opacity": 0.9
+      }
+    });
+
+    map.on("click", "hydro-outages-circle", (e) => {
+      const props = e.features[0].properties;
+
+      new maplibregl.Popup()
+        .setLngLat(e.lngLat)
+        .setHTML(popupHtml(props))
+        .addTo(map);
+    });
+
+    map.on("mouseenter", "hydro-outages-circle", () => {
+      map.getCanvas().style.cursor = "pointer";
+    });
+
+    map.on("mouseleave", "hydro-outages-circle", () => {
+      map.getCanvas().style.cursor = "";
+    });
+
+    setupControls();
+
+    try {
+      await loadOutages();
+      zoomToAllOutages();
+    } catch (error) {
+      console.error(error);
+      document.getElementById("outage-list").innerHTML =
+        '<p class="muted">Could not load Hydro-Québec outage data.</p>';
+    }
+
+    setInterval(loadOutages, 5 * 60 * 1000);
+  });
+
+  function downloadFile(filename, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = filename;
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
+    function exportCsv() {
+      const features = filteredOutages();
+
+      const headers = [
+        "affected_customers",
+        "severity_label",
+        "status_label",
+        "cause_label",
+        "municipality_code",
+        "outage_start",
+        "estimated_restore",
+        "longitude",
+        "latitude"
+      ];
+
+      const rows = features.map(feature => {
+        const props = feature.properties;
+        const [lon, lat] = feature.geometry.coordinates;
+
+        return [
+          props.affected_customers,
+          props.severity_label,
+          props.status_label,
+          props.cause_label,
+          props.municipality_code,
+          props.outage_start,
+          props.estimated_restore,
+          lon,
+          lat
+        ].map(value => '"' + String(value ?? "").replaceAll('"', '""') + '"').join(",");
+      });
+
+      downloadFile(
+        "hydro-quebec-outages.csv",
+        [headers.join(","), ...rows].join("\n"),
+        "text/csv"
+      );
+    }
+
+    function exportGeoJson() {
+      downloadFile(
+        "hydro-quebec-outages.geojson",
+        JSON.stringify(
+          {
+            type: "FeatureCollection",
+            features: filteredOutages()
+          },
+          null,
+          2
+        ),
+        "application/geo+json"
+      );
+    }
+</script>
+
+</body>
+</html>
+EOF
+
+echo "=== Setting permissions ==="
+# Keep app directory traversable for bind-mounted Docker volumes.
+chown root:root "$APP_DIR"
+chmod 755 "$APP_DIR"
+
+# Protect secrets.
+chown root:root "$APP_DIR/.env"
+chmod 600 "$APP_DIR/.env"
+
+# PostGIS container runs as the postgres user, commonly UID 999.
+mkdir -p "$APP_DIR/postgis-data"
+chown -R 999:999 "$APP_DIR/postgis-data"
+chmod 700 "$APP_DIR/postgis-data"
+
+# Lab-friendly writable directories for app containers.
+chmod -R 777 "$APP_DIR/geoserver-data" "$APP_DIR/pgadmin-data" "$APP_DIR/caddy-data" "$APP_DIR/caddy-config"
+
+echo "=== Starting Docker Compose stack ==="
+
+cd "$APP_DIR"
+
+if [[ "$ENABLE_PGADMIN" == "true" ]]; then
+  docker compose --profile admin up -d
+else
+  docker compose up -d
+fi
+
+echo "=== Waiting for containers ==="
+
+sleep 30
+docker compose ps
+
+echo "=== Running initial Hydro-Québec outage import ==="
+
+for i in $(seq 1 30); do
+  if docker compose exec -T postgis pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"; then
+    echo "PostGIS is ready"
+    break
+  fi
+
+  echo "Waiting for PostGIS... attempt $i"
+  sleep 10
+done
+
+docker compose --profile importer build hydro_importer
+docker compose --profile importer run --rm hydro_importer || true
+
+echo "=== Installing Hydro-Québec outage import cron job ==="
+
+cat > /usr/local/bin/import-hydro-quebec-outages <<'IMPORTER_RUNNER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /opt/opengis
+
+/usr/bin/docker compose --profile importer run --rm hydro_importer \
+  >> /var/log/hydro-quebec-outages-import.log 2>&1
+IMPORTER_RUNNER
+
+chmod +x /usr/local/bin/import-hydro-quebec-outages
+
+cat > /etc/cron.d/hydro-quebec-outages <<'CRON'
+*/15 * * * * root /usr/local/bin/import-hydro-quebec-outages
+CRON
+
+chmod 644 /etc/cron.d/hydro-quebec-outages
+
+echo "=== Auto-publishing Hydro-Québec layer in GeoServer ==="
+
+for i in $(seq 1 60); do
+  if curl -fsS -u "admin:$GEOSERVER_ADMIN_PASSWORD" "http://localhost/geoserver/rest/about/version.xml" >/dev/null 2>&1; then
+    echo "GeoServer REST API is ready"
+    break
+  fi
+
+  echo "Waiting for GeoServer REST API... attempt $i"
+  sleep 10
+done
+
+curl -fsS -u "admin:$GEOSERVER_ADMIN_PASSWORD" \
+  -XPOST \
+  -H "Content-Type: application/json" \
+  -d '{"workspace":{"name":"hydro"}}' \
+  "http://localhost/geoserver/rest/workspaces" || true
+
+curl -fsS -u "admin:$GEOSERVER_ADMIN_PASSWORD" \
+  -XPOST \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"dataStore\": {
+      \"name\": \"postgis\",
+      \"connectionParameters\": {
+        \"host\": \"postgis\",
+        \"port\": \"5432\",
+        \"database\": \"$POSTGRES_DB\",
+        \"schema\": \"public\",
+        \"user\": \"$POSTGRES_USER\",
+        \"passwd\": \"$POSTGRES_PASSWORD\",
+        \"dbtype\": \"postgis\"
+      }
+    }
+  }" \
+  "http://localhost/geoserver/rest/workspaces/hydro/datastores" || true
+
+curl -fsS -u "admin:$GEOSERVER_ADMIN_PASSWORD" \
+  -XPOST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "featureType": {
+      "name": "hydro_quebec_outages_current",
+      "nativeName": "hydro_quebec_outages_current",
+      "title": "Hydro-Québec Current Outages",
+      "srs": "EPSG:4326"
+    }
+  }' \
+  "http://localhost/geoserver/rest/workspaces/hydro/datastores/postgis/featuretypes" || true
+
+cat > /etc/motd <<EOF
+OpenGIS platform deployed.
+
+App directory:
+$APP_DIR
+
+URLs:
+http://$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || hostname -f)/
+http://$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || hostname -f)/geoserver
+http://$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || hostname -f)/tiles
+http://$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || hostname -f)/pgadmin
+
+Logs:
+sudo tail -f /var/log/opengis-bootstrap.log
+cd /opt/opengis && sudo docker compose logs -f
+EOF
+
+echo "=== OpenGIS Terraform bootstrap completed ==="
+date
