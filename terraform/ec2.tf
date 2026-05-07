@@ -1,22 +1,7 @@
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
 resource "aws_instance" "opengis" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
-  subnet_id                   = aws_subnet.public.id
+  subnet_id                   = aws_subnet.public[0].id
   vpc_security_group_ids      = [aws_security_group.opengis.id]
   key_name                    = aws_key_pair.main.key_name
   iam_instance_profile        = aws_iam_instance_profile.ec2.name
@@ -60,4 +45,40 @@ resource "aws_instance" "opengis" {
     aws_s3_object.opengis_app,
     aws_iam_role_policy_attachment.opengis_artifacts_read
   ]
+}
+
+resource "aws_instance" "bastion" {
+  count = var.enable_bastion ? 1 : 0
+
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.bastion_instance_type
+  subnet_id                   = aws_subnet.public[0].id
+  vpc_security_group_ids      = [aws_security_group.bastion[0].id]
+  associate_public_ip_address = true
+
+  key_name = aws_key_pair.main.key_name
+
+  iam_instance_profile = aws_iam_instance_profile.ec2.name
+
+  user_data = <<-EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  curl \
+  jq \
+  unzip \
+  dnsutils \
+  netcat-openbsd \
+  postgresql-client \
+  nfs-common \
+  awscli
+
+echo "Bastion ready" > /etc/motd
+EOF
+
+  tags = {
+    Name = "${local.name}-bastion"
+  }
 }

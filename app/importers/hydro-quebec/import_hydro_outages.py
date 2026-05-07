@@ -293,33 +293,73 @@ def refresh_outages(conn, version: str, outages: list) -> int:
     conn.commit()
     return len(parsed)
 
-
 def main():
     version = get_latest_bis_version()
     outages = fetch_outages(version)
+
     print(f"Hydro-Québec BIS version: {version}")
     print(f"Outage records found: {len(outages)}")
+
     conn = connect()
+    lock_acquired = False
+
     try:
+        # Prevent multiple ASG instances from running the importer at the same time.
+        # This lock is tied to this PostgreSQL connection/session.
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s);", (80707001,))
+            lock_acquired = cur.fetchone()[0]
+
+        if not lock_acquired:
+            print("Another Hydro-Québec importer is already running. Exiting.")
+            return
+
         init_schema(conn)
+
         count = refresh_outages(conn, version, outages)
+
         print(f"Imported {count} current outage records into PostGIS")
+
     except Exception as exc:
         conn.rollback()
+
         try:
             init_schema(conn)
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO public.hydro_quebec_import_runs (source_version, records_found, records_imported, success, error_message)
-                    VALUES (%s, %s, 0, false, %s);
-                """, (version, len(outages), str(exc)))
-                conn.commit()
-        except Exception:
-            conn.rollback()
-        raise
-    finally:
-        conn.close()
 
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.hydro_quebec_import_runs (
+                        source_version,
+                        records_found,
+                        records_imported,
+                        success,
+                        error_message
+                    )
+                    VALUES (%s, %s, 0, false, %s);
+                    """,
+                    (version, len(outages), str(exc)),
+                )
+
+            conn.commit()
+
+        except Exception as log_exc:
+            conn.rollback()
+            print(f"Could not write failed import run record: {log_exc}")
+
+        raise
+
+    finally:
+        if lock_acquired:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s);", (80707001,))
+                conn.commit()
+            except Exception as unlock_exc:
+                conn.rollback()
+                print(f"Could not release advisory lock cleanly: {unlock_exc}")
+
+        conn.close()
 
 if __name__ == "__main__":
     main()

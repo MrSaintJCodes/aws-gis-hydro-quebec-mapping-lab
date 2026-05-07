@@ -14,20 +14,17 @@ services:
       - ./initdb:/docker-entrypoint-initdb.d
     networks:
       - opengis
-
   geoserver:
     image: ${GEOSERVER_IMAGE}
     container_name: opengis-geoserver
     restart: unless-stopped
-    depends_on:
-      - postgis
     env_file:
       - .env
     environment:
       GEOSERVER_ADMIN_USER: admin
       GEOSERVER_ADMIN_PASSWORD: ${GEOSERVER_ADMIN_PASSWORD}
     volumes:
-      - ./geoserver-data:/opt/geoserver_data
+      - ${EFS_MOUNT_DIR}/geoserver-data:/opt/geoserver_data
     networks:
       - opengis
 
@@ -35,12 +32,10 @@ services:
     image: pramsey/pg_tileserv:latest-amd64
     container_name: opengis-pg-tileserv
     restart: unless-stopped
-    depends_on:
-      - postgis
     env_file:
       - .env
     environment:
-      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgis:5432/${POSTGRES_DB}"
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
     networks:
       - opengis
 
@@ -48,12 +43,10 @@ services:
     image: pramsey/pg_featureserv:latest
     container_name: opengis-pg-featureserv
     restart: unless-stopped
-    depends_on:
-      - postgis
     env_file:
       - .env
     environment:
-      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgis:5432/${POSTGRES_DB}"
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
     networks:
       - opengis
 
@@ -62,13 +55,14 @@ services:
     container_name: opengis-hydro-importer
     profiles:
       - importer
-    depends_on:
-      - postgis
     env_file:
       - .env
     environment:
-      POSTGRES_HOST: postgis
-      POSTGRES_PORT: 5432
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     networks:
       - opengis
 
@@ -78,8 +72,6 @@ services:
     restart: unless-stopped
     profiles:
       - admin
-    depends_on:
-      - postgis
     env_file:
       - .env
     environment:
@@ -101,7 +93,6 @@ services:
       - pg_featureserv
     ports:
       - "80:80"
-      - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./www:/usr/share/caddy:ro

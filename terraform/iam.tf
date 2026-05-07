@@ -1,5 +1,5 @@
 resource "aws_iam_role" "ec2_role" {
-  name = "${var.project_name}-ec2-role"
+  name = "${local.name}-ec2-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -13,18 +13,18 @@ resource "aws_iam_role" "ec2_role" {
   })
 }
 
+resource "aws_iam_instance_profile" "ec2" {
+  name = "${local.name}-instance-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
 resource "aws_iam_role_policy_attachment" "ssm" {
   role       = aws_iam_role.ec2_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_instance_profile" "ec2" {
-  name = "${var.project_name}-instance-profile"
-  role = aws_iam_role.ec2_role.name
-}
-
 resource "aws_iam_policy" "opengis_artifacts_read" {
-  name = "${var.project_name}-artifacts-read"
+  name = "${local.name}-artifacts-read"
 
   policy = jsonencode({
     Version = "2012-10-17"

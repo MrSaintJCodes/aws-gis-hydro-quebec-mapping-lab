@@ -37,7 +37,7 @@ rm -f /etc/apt/sources.list.d/docker.sources /etc/apt/sources.list.d/docker.list
 rm -f /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.asc
 
 apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg lsb-release unzip jq awscli cron
+DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg lsb-release unzip jq awscli cron nfs-common
 
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -108,6 +108,30 @@ chmod 600 "$APP_DIR/.env"
 chown -R 999:999 "$APP_DIR/postgis-data"
 chmod 700 "$APP_DIR/postgis-data"
 chmod -R 777 "$APP_DIR/geoserver-data" "$APP_DIR/pgadmin-data" "$APP_DIR/caddy-data" "$APP_DIR/caddy-config"
+
+echo "=== Mounting EFS shared storage ==="
+
+EFS_MOUNT_DIR="${EFS_MOUNT_DIR:-/mnt/opengis-efs}"
+
+if [[ -n "${EFS_DNS_NAME:-}" ]]; then
+  mkdir -p "$EFS_MOUNT_DIR"
+
+  if ! mountpoint -q "$EFS_MOUNT_DIR"; then
+    mount -t nfs4 \
+      -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport \
+      "$EFS_DNS_NAME:/" \
+      "$EFS_MOUNT_DIR"
+  fi
+
+  grep -q "$EFS_DNS_NAME:/" /etc/fstab || {
+    echo "$EFS_DNS_NAME:/ $EFS_MOUNT_DIR nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport 0 0" >> /etc/fstab
+  }
+
+  mkdir -p "$EFS_MOUNT_DIR/geoserver-data"
+  chmod -R 777 "$EFS_MOUNT_DIR/geoserver-data"
+else
+  echo "WARNING: EFS_DNS_NAME not set. GeoServer data will not be shared."
+fi
 
 echo "=== Starting Docker Compose stack ==="
 cd "$APP_DIR"

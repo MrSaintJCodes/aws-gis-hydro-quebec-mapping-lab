@@ -5,10 +5,10 @@ data "archive_file" "opengis_app" {
 }
 
 resource "aws_s3_bucket" "opengis_artifacts" {
-  bucket_prefix = "${var.project_name}-artifacts-"
+  bucket_prefix = "${local.name}-artifacts-"
 
   tags = {
-    Name = "${var.project_name}-artifacts"
+    Name = "${local.name}-artifacts"
   }
 }
 
